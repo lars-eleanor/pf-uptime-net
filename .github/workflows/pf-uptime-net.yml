@@ -157,8 +157,15 @@ jobs:
           # into grep. A pipe into grep -q closes the pipe early and, under
           # pipefail, produced a SIGPIPE-driven FALSE "down" in an earlier
           # version of this probe. Do not reintroduce a pipe here.
+          # Takes exactly ONE argument (the url). It previously also took a "kind"
+          # argument; when the second target stopped needing it the parameter was
+          # removed from the CALLERS but left in this signature, and under `set -u`
+          # every probe then died on the unbound $2 — returning non-zero with an
+          # EMPTY reason, which the loop read as a confirmed outage and emailed a
+          # false alarm (2026-08-28, run 33132957750). Hence the empty-reason guard
+          # below. Keep this signature and the call sites in sync.
           probe() {
-            local url="$1" kind="$2" body http_code
+            local url="$1" body http_code
             body="$(curl -sL -m 25 -A 'PianoFantasy-UptimeNet/2.0 (+https://pianofantasy.com; out-of-band uptime net)' -w $'\n%{http_code}' "$url" 2>/dev/null)"
             http_code="$(tail -n1 <<<"$body")"
             body="$(sed '$d' <<<"$body")"
@@ -193,11 +200,28 @@ jobs:
                 continue
               fi
 
+              # HARNESS-FAULT GUARD. Every genuine failure path in probe() prints a
+              # reason before returning 1. An EMPTY reason therefore means the probe
+              # function itself broke (unbound variable, missing binary), not that
+              # the site is down. Alarming on that produces a false outage email, so
+              # we shout in the log and keep watching instead. This deliberately
+              # fails OPEN for a harness bug while still failing CLOSED for a real
+              # site failure, which always carries a reason.
+              if [ -z "$reason" ]; then
+                echo "::warning::Probe harness fault for ${name}: probe() returned failure with no reason. NOT treating as an outage. Fix the probe."
+                continue
+              fi
+
               # Anti-flap: one failure is not an outage. Re-probe after 15s.
               echo "[${NOW}] cycle ${CYCLE} ${name}: first probe FAILED — ${reason}. Re-checking in 15s…"
               sleep 15
               if reason2="$(probe "$url")"; then
                 echo "[${NOW}] cycle ${CYCLE} ${name}: recheck PASSED — ${reason2}. Single flap, not an outage."
+                continue
+              fi
+
+              if [ -z "$reason2" ]; then
+                echo "::warning::Probe harness fault for ${name} on recheck: no reason returned. NOT treating as an outage."
                 continue
               fi
 
