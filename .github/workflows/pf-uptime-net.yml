@@ -1,0 +1,267 @@
+# pf-uptime-net.yml — OUT-OF-BAND uptime net for Piano Fantasy (Layer C4, v2).
+#
+# WHY THIS REPO EXISTS AT ALL (root cause, measured 2026-08-28 by Sage)
+#   The predecessor (pf-uptime-deadman in the PRIVATE repo lars-eleanor/pka-team-backup)
+#   asks for cron '*/5' = 288 runs/day. Measured over its entire life
+#   (2026-06-19 -> 2026-08-27, 1276 runs) it NEVER once achieved that cadence:
+#   it delivered 10-17 runs/day in Jun/Jul and 22-47/day in Aug, with observed
+#   holes of 9.9h and 10.1h. That is 4-6% of requested ticks.
+#   This is GitHub's DOCUMENTED schedule behaviour, not a fault in that workflow:
+#   "The schedule event can be delayed during periods of high loads of GitHub
+#   Actions workflow runs... If the load is sufficiently high enough, some queued
+#   jobs may be dropped."
+#   It is NOT minutes exhaustion: GitHub BLOCKS Actions on quota exhaustion, and
+#   a manual workflow_dispatch on 2026-08-28T01:24:13Z started and completed
+#   successfully in <20s. Blocked accounts cannot do that.
+#
+# THE FIX: DO NOT DEPEND ON THE SCHEDULER.
+#   1. This repo is PUBLIC, so standard GitHub-hosted runner minutes are FREE and
+#      UNLIMITED (GitHub billing docs). The private repo was capped at 2,000
+#      min/month, which alone makes 288 one-minute runs/day (~8,600 min/month)
+#      unaffordable there. Here, runner time is not a constraint.
+#   2. ONE RUN COVERS A LONG WINDOW. Instead of one run per probe, a single run
+#      probes on a ~60s loop for LOOP_MINUTES (default 50). Coverage inside a run
+#      is continuous and owes nothing to GitHub's cron.
+#   3. THE RUN RE-ARMS ITSELF. At the end (always(), including on a detected
+#      outage) the run dispatches the next run via workflow_dispatch using
+#      GITHUB_TOKEN with actions:write. Chained runs = continuous coverage.
+#   4. The hourly `schedule` below is ONLY a coarse re-arm safety net for the case
+#      where a chain link dies mid-run (runner eviction, GitHub incident). It is
+#      deliberately hourly, not */5: we now know that trigger is unreliable and we
+#      no longer rely on it for cadence.
+#
+# NO SECRETS LIVE HERE. This repo is public on purpose, so it deliberately holds
+#   nothing sensitive: two already-public hostnames and a curl. The alarm channel
+#   is GitHub's BUILT-IN workflow-failure email to the account owner — no bot
+#   token, no webhook, no API key. The private pf-uptime-deadman keeps the
+#   Telegram channel; this net is the email channel and the fast one.
+#
+# FAILURE-DOMAIN INDEPENDENCE (the entire point — do not erode this)
+#   - NOT on Lars's Mac: survives a full-Mac-down, which the on-Mac 3-min checker
+#     and the crons.json dispatcher by definition cannot.
+#   - NOT on Cloudflare: both watched hosts are fronted by Cloudflare, so a
+#     Cloudflare Worker monitor would die together with the thing it watches. A
+#     GitHub runner fails independently, so a bad Cloudflare state is DETECTED
+#     here rather than silencing the alarm.
+#   - NOT in the pianofantasy-web or pf-platform repos: a bad deploy to either
+#     cannot disable this net.
+#
+# EDGE-AWARE: we curl the PUBLIC hostnames through Cloudflare exactly as a
+#   browser would. This catches edge failures (bad CF config, dead Worker route,
+#   expired cert) that an origin-only check would miss.
+#
+# THE PLATFORM PROBE MUST STAY DB-FREE. It checks app.pianofantasy.com/sign-in
+#   (a Client Component page, no database call), NOT /api/health. A DB-touching
+#   probe on a 60s loop would keep Neon's compute awake 24/7 and defeat
+#   scale-to-zero — the documented ~$45/mo regression. Liveness is "is the app
+#   serving"; DB-availability is the on-Mac 20-min probe's job. DO NOT change
+#   this URL to a DB-backed route.
+#
+# DOUBLE-CONFIRM (anti-flap): a host that fails is re-probed after 15s. Only a
+#   host failing BOTH probes counts as down. Prevents a flaky runner emailing Lars.
+#
+# ALARM-STORM DAMPER: on a confirmed outage the loop breaks immediately (so the
+#   email is ~2 min behind the outage, not up to 50), but the run then holds until
+#   it has lasted MIN_LINK_SECONDS before failing. During a SUSTAINED outage that
+#   throttles the failure emails to roughly one per 10 minutes instead of one
+#   every 2 minutes. Detection stays fast; the mailbox stays usable.
+#
+# ORDER OF OPERATIONS ON AN OUTAGE IS LOAD-BEARING: re-arm FIRST, then fail.
+#   A failing step stops later steps, so if we alarmed before re-arming, a real
+#   outage would kill the chain and leave us relying on the broken scheduler at
+#   the exact moment we need monitoring most.
+#
+# Owner: Sage (Database & Back-Office Integration).
+
+name: pf-uptime-net
+
+on:
+  schedule:
+    # COARSE SAFETY NET ONLY — not the cadence mechanism. Minute 13 deliberately
+    # avoids the top of the hour, which GitHub names as its peak-congestion window.
+    - cron: '13 * * * *'
+  workflow_dispatch:
+    inputs:
+      loop_minutes:
+        description: >-
+          How many minutes this run should keep probing before handing off to the
+          next chained run. Default 50 (GitHub job limit is 360). Lower values are
+          for testing the chain only.
+        required: false
+        default: '50'
+
+# actions:write is required so the run can dispatch its own successor.
+# contents:read is the minimum needed to resolve the workflow. Nothing else.
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    # Hard ceiling well under GitHub's 360-min job limit, so a wedged run cannot
+    # sit forever holding the single-runner slot.
+    timeout-minutes: 60
+    steps:
+      # ---------------------------------------------------------------------
+      # Single-flight guard. The hourly safety-net schedule can fire while a
+      # chained run is already covering the window. Two concurrent watchers are
+      # harmless but wasteful and would double the alarm emails, so a run that
+      # finds an OLDER run of this same workflow already in progress exits 0
+      # immediately. We compare run IDs (monotonic) rather than timestamps.
+      # ---------------------------------------------------------------------
+      - name: Single-flight guard — stand down if an older run is already watching
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          SELF="${{ github.run_id }}"
+          OLDER="$(gh api "/repos/${{ github.repository }}/actions/workflows/pf-uptime-net.yml/runs?status=in_progress&per_page=100" \
+                     --jq '.workflow_runs[].id' 2>/dev/null | awk -v s="$SELF" '$1 < s' | head -1)"
+          if [ -n "${OLDER:-}" ]; then
+            echo "Run ${OLDER} is already watching. Standing down (this is normal for the hourly safety net)."
+            echo "standdown=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "No older watcher in progress. This run takes the watch."
+            echo "standdown=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------------------------------------------------------------------
+      # The watch loop. Never exits non-zero — it records the outcome and lets a
+      # later step do the alarming, so the re-arm step is guaranteed to run.
+      # ---------------------------------------------------------------------
+      - name: Watch loop — probe both public hostnames every 60s
+        id: watch
+        if: steps.guard.outputs.standdown == 'no'
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # Both targets are checked exactly as a visitor's browser would see them.
+          # PLATFORM_URL is DB-free on purpose — see the header note on Neon.
+          MARKETING_URL="https://pianofantasy.com/"
+          PLATFORM_URL="https://app.pianofantasy.com/sign-in"
+
+          LOOP_MINUTES="${{ github.event.inputs.loop_minutes || '50' }}"
+          PROBE_INTERVAL_SECONDS=60
+          MIN_LINK_SECONDS=600
+
+          START_EPOCH="$(date +%s)"
+          DEADLINE=$(( START_EPOCH + LOOP_MINUTES * 60 ))
+
+          # One probe of one target. Echoes a human reason on stdout; returns 0
+          # healthy / 1 unhealthy.
+          # NOTE: all body matching uses here-strings (<<<"$body"), never a pipe
+          # into grep. A pipe into grep -q closes the pipe early and, under
+          # pipefail, produced a SIGPIPE-driven FALSE "down" in an earlier
+          # version of this probe. Do not reintroduce a pipe here.
+          probe() {
+            local url="$1" kind="$2" body http_code
+            body="$(curl -sL -m 25 -A 'PianoFantasy-UptimeNet/2.0 (+https://pianofantasy.com; out-of-band uptime net)' -w $'\n%{http_code}' "$url" 2>/dev/null)"
+            http_code="$(tail -n1 <<<"$body")"
+            body="$(sed '$d' <<<"$body")"
+
+            if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
+              echo "network error / no response (curl code 000)"; return 1
+            fi
+            if [ "$http_code" != "200" ]; then
+              echo "HTTP ${http_code} (expected 200)"; return 1
+            fi
+            if grep -qi '<html' <<<"$body"; then echo "200 + HTML body"; return 0; fi
+            echo "200 but body has no <html> (blank/error page)"; return 1
+          }
+
+          CHECKS=(
+            "marketing|${MARKETING_URL}"
+            "platform|${PLATFORM_URL}"
+          )
+
+          DOWN=""
+          CYCLE=0
+
+          while :; do
+            CYCLE=$(( CYCLE + 1 ))
+            NOW="$(date -u +%H:%M:%SZ)"
+
+            for entry in "${CHECKS[@]}"; do
+              IFS='|' read -r name url <<< "$entry"
+
+              if reason="$(probe "$url")"; then
+                echo "[${NOW}] cycle ${CYCLE} ${name}: HEALTHY — ${reason}"
+                continue
+              fi
+
+              # Anti-flap: one failure is not an outage. Re-probe after 15s.
+              echo "[${NOW}] cycle ${CYCLE} ${name}: first probe FAILED — ${reason}. Re-checking in 15s…"
+              sleep 15
+              if reason2="$(probe "$url")"; then
+                echo "[${NOW}] cycle ${CYCLE} ${name}: recheck PASSED — ${reason2}. Single flap, not an outage."
+                continue
+              fi
+
+              echo "[${NOW}] cycle ${CYCLE} ${name}: recheck FAILED — ${reason2}. CONFIRMED DOWN."
+              DOWN="${name} (${url}): ${reason2}"
+              break
+            done
+
+            # Break the loop the moment an outage is confirmed, so the alarm is
+            # ~2 minutes behind the outage rather than up to LOOP_MINUTES.
+            [ -n "$DOWN" ] && break
+
+            [ "$(date +%s)" -ge "$DEADLINE" ] && break
+            sleep "$PROBE_INTERVAL_SECONDS"
+          done
+
+          if [ -n "$DOWN" ]; then
+            # Alarm-storm damper — see header. Hold this link open so a sustained
+            # outage produces roughly one failure email per 10 minutes.
+            ELAPSED=$(( $(date +%s) - START_EPOCH ))
+            if [ "$ELAPSED" -lt "$MIN_LINK_SECONDS" ]; then
+              HOLD=$(( MIN_LINK_SECONDS - ELAPSED ))
+              echo "Outage confirmed after ${ELAPSED}s. Holding ${HOLD}s before alarming (email-storm damper)."
+              sleep "$HOLD"
+            fi
+          fi
+
+          {
+            echo "down<<__EOF__"
+            echo "${DOWN}"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Watch loop finished after ${CYCLE} cycles."
+
+      # ---------------------------------------------------------------------
+      # Re-arm BEFORE alarming. always() so this runs even if the watch loop
+      # errored — a broken chain during an outage is the worst possible state.
+      # Skipped when we stood down, because the older run will re-arm instead.
+      # ---------------------------------------------------------------------
+      - name: Re-arm — dispatch the next chained run
+        if: always() && steps.guard.outputs.standdown == 'no'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          # No inputs: the successor uses the default loop_minutes, so a short
+          # test run cannot pin the whole chain to a test cadence.
+          if gh workflow run pf-uptime-net.yml --repo "${{ github.repository }}"; then
+            echo "Chain re-armed: successor dispatched."
+          else
+            echo "::warning::Could not dispatch the successor run. The hourly safety-net schedule is now the only re-arm path; coverage degrades to coarse until it fires."
+          fi
+
+      # ---------------------------------------------------------------------
+      # The alarm. Failing this job is what triggers GitHub's built-in
+      # workflow-failure email to the account owner. That email IS the off-Mac
+      # alarm; there is deliberately no inbound channel back to the Mac.
+      # ---------------------------------------------------------------------
+      - name: Alarm — fail the job so GitHub emails the owner
+        if: steps.watch.outputs.down != ''
+        shell: bash
+        run: |
+          echo "::error::PIANO FANTASY UPTIME NET TRIPPED — a public hostname is DOWN, double-confirmed from GitHub's out-of-band runner. This fires independently of the Mac and independently of Cloudflare. Investigate immediately."
+          echo "::error::DOWN: ${{ steps.watch.outputs.down }}"
+          exit 1
