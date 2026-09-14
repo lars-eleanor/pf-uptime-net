@@ -71,9 +71,35 @@
 #   outage would kill the chain and leave us relying on the broken scheduler at
 #   the exact moment we need monitoring most.
 #
+# TELEGRAM ALARM ADDED 2026-09-14 (Sage, watchdog-proof pass) — WHY THE EMAIL
+#   CHANNEL ALONE WAS NOT AN ALARM:
+#   (1) GitHub sends the workflow-failure email to the TRIGGERING ACTOR. Every
+#       chained link is dispatched by GITHUB_TOKEN, so its actor is
+#       github-actions[bot] (measured: run 34843027975 actor=github-actions[bot]).
+#       The hourly schedule run nearly always stands down behind a live chain
+#       link, so the run that detects an outage is almost always a bot-dispatched
+#       one — and a bot has no mailbox. The failure email went to nobody.
+#   (2) Even runs triggered by the lars-eleanor account did not reach
+#       lars@pianofantasy.com: run 33132957750 (2026-08-28, actor lars-eleanor)
+#       failed and Eleanor found no GitHub email for it in any Gmail folder.
+#   So the job still FAILS (red run, and an email wherever GitHub does deliver
+#   one), but the alarm Lars actually receives is a direct Telegram message from
+#   this runner, identical in framing to pf-uptime-deadman. The two secrets
+#   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are repository secrets: encrypted, never
+#   exposed to fork PRs, never printed. The "contains no secrets" statement above
+#   now means: no secret is committed to the repository contents.
+#
+# ALARM SELF-TEST (no message sent): dispatch with alarm_selftest=yes. That run
+#   skips guard/watch/re-arm entirely and calls Telegram getMe + getChat with the
+#   same secrets the alarm uses, asserting the bot token is valid and the bot can
+#   reach Lars's chat — proving the channel without paging Lars. Its run-name is
+#   "alarm-selftest", which the single-flight guard ignores, so a self-test can
+#   never make a real chain link stand down.
+#
 # Owner: Sage (Database & Back-Office Integration).
 
 name: pf-uptime-net
+run-name: ${{ github.event.inputs.alarm_selftest == 'yes' && 'alarm-selftest' || 'pf-uptime-net' }}
 
 on:
   schedule:
@@ -89,6 +115,12 @@ on:
           for testing the chain only.
         required: false
         default: '50'
+      alarm_selftest:
+        description: >-
+          yes = verify the Telegram alarm credentials (getMe + getChat) and exit.
+          Sends NO message, probes nothing, does not re-arm the chain.
+        required: false
+        default: 'no'
 
 # actions:write is required so the run can dispatch its own successor.
 # contents:read is the minimum needed to resolve the workflow. Nothing else.
@@ -112,6 +144,7 @@ jobs:
       # ---------------------------------------------------------------------
       - name: Single-flight guard — stand down if an older run is already watching
         id: guard
+        if: github.event.inputs.alarm_selftest != 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -119,7 +152,7 @@ jobs:
           set -uo pipefail
           SELF="${{ github.run_id }}"
           OLDER="$(gh api "/repos/${{ github.repository }}/actions/workflows/pf-uptime-net.yml/runs?status=in_progress&per_page=100" \
-                     --jq '.workflow_runs[].id' 2>/dev/null | awk -v s="$SELF" '$1 < s' | head -1)"
+                     --jq '.workflow_runs[] | select(.display_title != "alarm-selftest") | .id' 2>/dev/null | awk -v s="$SELF" '$1 < s' | head -1)"
           if [ -n "${OLDER:-}" ]; then
             echo "Run ${OLDER} is already watching. Standing down (this is normal for the hourly safety net)."
             echo "standdown=yes" >> "$GITHUB_OUTPUT"
@@ -282,7 +315,47 @@ jobs:
       # workflow-failure email to the account owner. That email IS the off-Mac
       # alarm; there is deliberately no inbound channel back to the Mac.
       # ---------------------------------------------------------------------
-      - name: Alarm — fail the job so GitHub emails the owner
+      - name: Alarm — Telegram to Lars (off-Mac, team-investigating framing)
+        if: steps.watch.outputs.down != ''
+        shell: bash
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DOWN: ${{ steps.watch.outputs.down }}
+        run: |
+          set -uo pipefail
+          if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
+            echo "::error::Telegram secrets missing — the Telegram alarm cannot send. The job still fails below."
+            exit 0
+          fi
+          MSG="🔴 pianofantasy.com appears DOWN (confirmed from an off-Mac monitor, so this fires even if the Mac is off). Down: ${DOWN}. The team is investigating now — you will get a follow-up with the cause and the fix. Nothing for you to do yet."
+          RESP="$(curl -s -m 15 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+                    -d chat_id="${TG_CHAT}" --data-urlencode "text=${MSG}")"
+          if grep -q '"ok":true' <<<"$RESP"; then
+            echo "TELEGRAM_DELIVERED=true"
+          else
+            echo "::error::TELEGRAM_DELIVERED=false — response: $(head -c 300 <<<"$RESP")"
+          fi
+
+      - name: Alarm self-test — verify Telegram credentials, send nothing
+        if: github.event.inputs.alarm_selftest == 'yes'
+        shell: bash
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -uo pipefail
+          [ -n "${TG_TOKEN:-}" ] || { echo "::error::TELEGRAM_BOT_TOKEN secret missing"; exit 1; }
+          [ -n "${TG_CHAT:-}" ] || { echo "::error::TELEGRAM_CHAT_ID secret missing"; exit 1; }
+          ME="$(curl -s -m 15 "https://api.telegram.org/bot${TG_TOKEN}/getMe")"
+          grep -q '"ok":true' <<<"$ME" || { echo "::error::getMe failed: $(head -c 200 <<<"$ME")"; exit 1; }
+          echo "getMe ok — bot username: $(grep -o '"username":"[^"]*"' <<<"$ME")"
+          CH="$(curl -s -m 15 "https://api.telegram.org/bot${TG_TOKEN}/getChat?chat_id=${TG_CHAT}")"
+          grep -q '"ok":true' <<<"$CH" || { echo "::error::getChat failed: $(head -c 200 <<<"$CH")"; exit 1; }
+          echo "getChat ok — chat type: $(grep -o '"type":"[^"]*"' <<<"$CH" | head -1)"
+          echo "ALARM_CHANNEL_VERIFIED=true (no message sent)"
+
+      - name: Alarm — fail the job (red run; GitHub email where it is delivered)
         if: steps.watch.outputs.down != ''
         shell: bash
         run: |
