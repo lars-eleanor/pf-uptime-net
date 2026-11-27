@@ -121,11 +121,19 @@ on:
           Sends NO message, probes nothing, does not re-arm the chain.
         required: false
         default: 'no'
+      keepalive_after_days:
+        description: >-
+          Write the keepalive commit when the newest commit on the default branch
+          is at least this many days old. Default 30. 0 is for testing the
+          keepalive write path only.
+        required: false
+        default: '30'
 
 # actions:write is required so the run can dispatch its own successor.
-# contents:read is the minimum needed to resolve the workflow. Nothing else.
+# contents:write is required ONLY by the keepalive step, which updates the single
+# file .keepalive. Nothing else in this workflow writes to the repo.
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 jobs:
@@ -159,6 +167,54 @@ jobs:
           else
             echo "No older watcher in progress. This run takes the watch."
             echo "standdown=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------------------------------------------------------------------
+      # Keepalive. GitHub AUTO-DISABLES a scheduled workflow in a PUBLIC repo
+      # after 60 days with no repository activity, and a disabled workflow also
+      # refuses workflow_dispatch, so the self-chain dies with it. Measured: the
+      # last human push was 2026-09-14; GitHub set state=disabled_inactivity at
+      # 2026-11-13T16:15Z and this net was dead for 14 days until 2026-11-27.
+      # This repo has no other reason to receive commits, so the run makes its
+      # own: when the newest commit is >= keepalive_after_days (30) old, it
+      # rewrites .keepalive with today's date (one bot commit a month, 30 days
+      # of margin). Every run checks, so it does not depend on any one run.
+      # Never stops the watch: a failed write is recorded and turns the run red
+      # in the last step, AFTER re-arm, so Layer D's conclusion check sees it
+      # ~30 days before GitHub would disable anything.
+      # ---------------------------------------------------------------------
+      - name: Keepalive — stop GitHub auto-disabling this schedule
+        id: keepalive
+        if: steps.guard.outputs.standdown == 'no'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AFTER_DAYS: ${{ github.event.inputs.keepalive_after_days || '30' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          REPO="${{ github.repository }}"
+          LAST="$(gh api "/repos/${REPO}/commits?per_page=1" --jq '.[0].commit.committer.date' 2>/dev/null)"
+          if [ -z "${LAST:-}" ]; then
+            echo "::warning::Keepalive could not read the newest commit date."
+            echo "failed=yes" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          AGE_DAYS=$(( ( $(date -u +%s) - $(date -u -d "$LAST" +%s) ) / 86400 ))
+          echo "Newest commit ${LAST} is ${AGE_DAYS} day(s) old; keepalive threshold ${AFTER_DAYS}."
+          if [ "$AGE_DAYS" -lt "$AFTER_DAYS" ]; then
+            echo "No keepalive needed."; exit 0
+          fi
+          SHA="$(gh api "/repos/${REPO}/contents/.keepalive" --jq '.sha' 2>/dev/null || true)"
+          BODY="$(printf 'Last keepalive: %s (run %s). See the Keepalive step in .github/workflows/pf-uptime-net.yml.\n' \
+                    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${{ github.run_id }}" | base64 -w0)"
+          ARGS=(-X PUT "/repos/${REPO}/contents/.keepalive"
+                -f message="chore: keepalive — repo activity so GitHub keeps the schedule enabled"
+                -f content="$BODY")
+          [ -n "${SHA:-}" ] && ARGS+=(-f sha="$SHA")
+          if gh api "${ARGS[@]}" --jq '.commit.sha' ; then
+            echo "Keepalive commit written."
+          else
+            echo "::warning::Keepalive commit FAILED. The run will be marked red after re-arm."
+            echo "failed=yes" >> "$GITHUB_OUTPUT"
           fi
 
       # ---------------------------------------------------------------------
@@ -361,4 +417,11 @@ jobs:
         run: |
           echo "::error::PIANO FANTASY UPTIME NET TRIPPED — a public hostname is DOWN, double-confirmed from GitHub's out-of-band runner. This fires independently of the Mac and independently of Cloudflare. Investigate immediately."
           echo "::error::DOWN: ${{ steps.watch.outputs.down }}"
+          exit 1
+
+      - name: Keepalive failed — fail the job (red run for Layer D, after re-arm)
+        if: always() && steps.keepalive.outputs.failed == 'yes'
+        shell: bash
+        run: |
+          echo "::error::KEEPALIVE FAILED — this repo gets no activity, so GitHub will auto-disable this schedule (and the whole chain) 60 days after the last commit. Fix the Keepalive step."
           exit 1
